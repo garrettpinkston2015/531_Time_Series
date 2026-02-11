@@ -1,0 +1,627 @@
+---
+title:  "SARIMA Model of Crime & Unemployment\\vspace{-2cm}"
+format: html
+number-sections: true
+jupyter: python3
+python: ~/venv/bin/python3
+---
+
+```{python}
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from statsmodels.tsa.arima.model import ARIMA
+from statsmodels.tsa.statespace.sarimax import SARIMAX
+from statsmodels.graphics.tsaplots import plot_acf
+from statsmodels.nonparametric.smoothers_lowess import lowess
+import warnings
+warnings.filterwarnings('ignore')
+```
+
+```{python}
+crime = pd.read_csv("rms_crime_incidents.csv")
+unemployment = pd.read_csv('unemployment_wayne_county.csv')
+```
+
+# Crime Data
+
+```{python}
+
+#| eval: false
+crime.head()
+```
+
+**Exploratory Data Analysis**
+
+```{python}
+
+# Turn str into dates
+crime['incident_occurred_at'] = pd.to_datetime(crime['incident_occurred_at'])
+
+# monthly period
+crime['Month'] = crime['incident_occurred_at'].dt.to_period('M')
+
+# Aggregate counts over each month and year
+# Starting from 2014
+crime_monthly = crime.groupby('Month').size().reset_index(name='Incidents')
+crime_monthly['Month'] = crime_monthly['Month'].dt.to_timestamp()
+crime_monthly = crime_monthly[crime_monthly['Month'].dt.year >= 2017]
+```
+
+```{python}
+
+#| label: fig-time-plot-incidents
+#| fig-cap: "Time plot of Incidents per Month"
+
+plt.figure(figsize=(5, 2))
+plt.title("Monthly Crime Incidents")
+plt.plot(crime_monthly['Month'], crime_monthly['Incidents'], '-')
+plt.xlabel('Month'); plt.ylabel('Incidents per Month')
+plt.tight_layout(); plt.show()
+```
+
+```{python}
+
+#| label: fig-acf-incidents
+#| fig-cap: "Sample Autocorrelation function plot of Incidents per Month"
+
+fig, ax = plt.subplots(figsize=(5, 2))
+plot_acf(crime_monthly['Incidents'], ax = ax, lags=20, bartlett_confint=False)
+plt.xlabel('Lag'); plt.ylabel('Sample Autocorrelation')
+plt.tight_layout(); plt.show()
+```
+
+**Model Fitting**
+
+Models without splitting
+```{python}
+monthly_incident_count = crime_monthly['Incidents']
+
+crime_sarima1 = SARIMAX(monthly_incident_count, order=(1,0,0), trend='c',seasonal_order=(1, 1, 0, 12)).fit()
+
+crime_sarima2 = SARIMAX(monthly_incident_count, order=(0,0,1), trend='c',seasonal_order=(0, 1, 1, 12)).fit()
+
+crime_sarima3 = SARIMAX(monthly_incident_count, order=(1,0,1), trend='c',seasonal_order=(1, 1, 1, 12)).fit()
+
+crime_sarima4 = SARIMAX(monthly_incident_count, order=(1,0,0), trend='c',seasonal_order=(2, 1, 0, 12)).fit()
+
+crime_sarima5 = SARIMAX(monthly_incident_count, order=(0,0,1), trend='c',seasonal_order=(1, 1, 0, 12)).fit()
+
+crime_sarima6 = SARIMAX(monthly_incident_count, order=(1,0,0), trend='c',seasonal_order=(1, 1, 1, 12)).fit()
+
+crime_sarima7 = SARIMAX(monthly_incident_count, order=(1,0,0), trend='c',seasonal_order=(0, 1, 1, 12)).fit()
+
+crime_sarima8 = SARIMAX(monthly_incident_count, order=(1,1,1), trend='c',seasonal_order=(1, 1, 1, 12)).fit()
+
+crime_sarima9 = SARIMAX(monthly_incident_count, order=(1,0,0), trend='c', seasonal_order=(1, 0, 0,12)).fit()
+
+crime_sarima10 = SARIMAX(monthly_incident_count, order=(1,0,0), trend='c', seasonal_order=(1, 1, 0, 12)).fit()
+
+crime_sarima11 = SARIMAX(monthly_incident_count, order=(1,0,0), trend='c', seasonal_order=(0, 1, 0,12)).fit()
+
+crime_sarima12 = SARIMAX(monthly_incident_count, order=(0,1,1), trend='c', seasonal_order=(0, 1, 1,12)).fit()
+```
+
+AIC
+```{python}
+crime_sarima1.aic.item()
+crime_sarima2.aic.item()
+crime_sarima3.aic.item()
+crime_sarima4.aic.item()
+crime_sarima5.aic.item()
+crime_sarima6.aic.item()
+crime_sarima7.aic.item()
+crime_sarima8.aic.item()
+crime_sarima9.aic.item()
+crime_sarima10.aic.item()
+crime_sarima11.aic.item()
+crime_sarima12.aic.item()
+```
+
+```{python}
+# crime_sarima1.summary() # intercept not significant
+# crime_sarima3.summary() # ma.L1 not significant
+# crime_sarima4.summary() # intercept and ar.S.L24 not significant
+crime_sarima6.summary() # all significant
+# crime_sarima7.summary() # all significant besides intercept
+# crime_sarima8.summary() # intercept, ar.L1, ar.S.L12 not significant
+crime_sarima9.summary() # intercept not significant
+#crime_sarima10.summary() # intercept is not significant
+# crime_sarima12.summary() # intercept not significant, but this is a commonly used model
+
+print(crime_sarima6.summary().tables[1])
+print(crime_sarima9.summary().tables[1])
+print(crime_sarima12.summary().tables[1])
+```
+
+**Check Roots**
+
+```{python}
+ar_roots = crime_sarima6.arroots
+print("Magnitude of AR roots:", np.abs(ar_roots)) ## Too close to boundary
+
+ar_roots = crime_sarima9.arroots
+print("Magnitude of AR roots > 1.1:", np.abs(ar_roots) > 1.1)
+print("Magnitude of AR roots:", np.abs(ar_roots))
+
+ma_roots = crime_sarima9.maroots
+print("Magnitude of MA roots > 1.1:", np.abs(ma_roots) > 1.1)
+print("Magnitude of MA roots:", np.abs(ma_roots))
+```
+
+**Residual Analysis**
+
+
+Models split by pre, during, post
+```{python}
+edges = [pd.Timestamp("2017-01-01"),pd.Timestamp("2020-03-01",), pd.Timestamp("2022-07-01"), pd.Timestamp("2100-01-01")]
+
+labels = ["pre", "during", "post"]
+
+crime_monthly["covid"] = pd.cut(crime_monthly["Month"], bins=edges, labels=labels, right=False)
+```
+Pre
+```{python}
+
+#| fig-cap: "Time plot of Incidents per Month Pre-Covid"
+
+pre_covid = crime_monthly[crime_monthly["covid"] == "pre"]
+
+# Plot
+plt.figure(figsize=(5, 2))
+plt.title("Monthly Crime Incidents before Covid")
+plt.plot(pre_covid['Month'], pre_covid['Incidents'], '-')
+plt.xlabel('Month')
+plt.ylabel('Incidents per Month')
+plt.tight_layout()
+plt.show()
+```
+```{python}
+
+#| label: fig-acf-incidents-pre
+#| fig-cap: "Sample Autocorrelation function (Pre-covid)"
+
+fig, ax = plt.subplots(figsize=(5, 2))
+plot_acf(pre_covid['Incidents'], ax = ax, lags=20, bartlett_confint=False)
+plt.xlabel('Lag'); plt.ylabel('Sample Autocorrelation')
+plt.tight_layout(); plt.show()
+```
+
+During
+
+```{python}
+
+#| fig-cap: "Time plot of Incidents per Month during Covid"
+
+during_covid = crime_monthly[crime_monthly["covid"] == "during"]
+
+# Plot
+plt.figure(figsize=(5, 2))
+plt.title("Monthly Crime Incidents during Covid")
+plt.plot(during_covid['Month'], during_covid['Incidents'], '-')
+plt.xlabel('Month')
+plt.ylabel('Incidents per Month')
+plt.tight_layout()
+plt.show()
+```
+
+```{python}
+
+#| label: fig-acf-incidents-during
+#| fig-cap: "Sample Autocorrelation function (During covid)"
+
+fig, ax = plt.subplots(figsize=(5, 2))
+plot_acf(during_covid['Incidents'], ax = ax, lags=20, bartlett_confint=False)
+plt.xlabel('Lag'); plt.ylabel('Sample Autocorrelation')
+plt.tight_layout(); plt.show()
+```
+
+Post
+
+```{python}
+
+#| fig-cap: "Time plot of Incidents per Month After Covid"
+post_covid = crime_monthly[crime_monthly["covid"] == "post"]
+
+# Plot
+plt.figure(figsize=(5, 2))
+plt.title("Monthly Crime Incidents After Covid")
+plt.plot(post_covid['Month'], post_covid['Incidents'], '-')
+plt.xlabel('Month')
+plt.ylabel('Incidents per Month')
+plt.tight_layout()
+plt.show()
+```
+
+```{python}
+
+#| label: fig-acf-incidents-post
+#| fig-cap: "Sample Autocorrelation function (Post-covid)"
+
+fig, ax = plt.subplots(figsize=(5, 2))
+plot_acf(post_covid['Incidents'], ax = ax, lags=20, bartlett_confint=False)
+plt.xlabel('Lag'); plt.ylabel('Sample Autocorrelation')
+plt.tight_layout(); plt.show()
+```
+
+**Model Fitting (Pre, During, Post)**
+
+PRE
+```{python}
+monthly_incident_count = pre_covid['Incidents']
+
+crime_sarima1_pre = SARIMAX(monthly_incident_count, order=(1,0,0), trend='c',seasonal_order=(1, 1, 0, 12)).fit()
+
+crime_sarima2_pre = SARIMAX(monthly_incident_count, order=(0,0,1), trend='c',seasonal_order=(0, 1, 1, 12)).fit()
+
+crime_sarima3_pre = SARIMAX(monthly_incident_count, order=(1,0,1), trend='c',seasonal_order=(1, 1, 1, 12)).fit()
+
+crime_sarima4_pre = SARIMAX(monthly_incident_count, order=(1,0,0), trend='c',seasonal_order=(2, 1, 0, 12)).fit()
+
+crime_sarima5_pre = SARIMAX(monthly_incident_count, order=(0,0,1), trend='c',seasonal_order=(1, 1, 0, 12)).fit()
+
+crime_sarima6_pre = SARIMAX(monthly_incident_count, order=(1,0,0), trend='c',seasonal_order=(1, 1, 1, 12)).fit()
+
+crime_sarima7_pre = SARIMAX(monthly_incident_count, order=(1,0,0), trend='c',seasonal_order=(0, 1, 1, 12)).fit()
+
+crime_sarima8_pre = SARIMAX(monthly_incident_count, order=(1,1,1), trend='c',seasonal_order=(1, 1, 1, 12)).fit()
+
+crime_sarima9_pre = SARIMAX(monthly_incident_count, order=(1,0,0), trend='c', seasonal_order=(1, 0, 0,12)).fit()
+
+crime_sarima10_pre = SARIMAX(monthly_incident_count, order=(1,0,0), trend='c', seasonal_order=(1, 1, 0, 12)).fit()
+
+crime_sarima11_pre = SARIMAX(monthly_incident_count, order=(1,0,0), trend='c', seasonal_order=(0, 1, 0,12)).fit()
+
+crime_sarima12_pre = SARIMAX(monthly_incident_count, order=(0,1,1), trend='c', seasonal_order=(0, 1, 1,12)).fit()
+
+crime_sarima13_pre = SARIMAX(monthly_incident_count, order=(1,0,0), trend='c', seasonal_order=(0, 0, 0, 12)).fit()
+
+crime_sarima13_pre = SARIMAX(monthly_incident_count, order=(1,0,0), trend='c', seasonal_order=(0, 0, 1, 12)).fit()
+
+crime_sarima14_pre = SARIMAX(monthly_incident_count, order=(1,0,0), trend='c', seasonal_order=(0, 0, 0, 12)).fit()
+```
+
+Check AIC
+```{python}
+#| echo: false
+crime_sarima1_pre.aic.item()
+crime_sarima2_pre.aic.item() 
+crime_sarima3_pre.aic.item()
+crime_sarima4_pre.aic.item() 
+crime_sarima5_pre.aic.item()
+crime_sarima6_pre.aic.item()
+crime_sarima7_pre.aic.item()
+crime_sarima8_pre.aic.item() 
+crime_sarima9_pre.aic.item() 
+crime_sarima10_pre.aic.item()
+crime_sarima11_pre.aic.item()
+crime_sarima12_pre.aic.item() 
+crime_sarima13_pre.aic.item() 
+crime_sarima14_pre.aic.item()
+```
+Coefficients for all models aren't significant. Should choose a simpler model? AR(1) worked. 
+```{python}
+print(crime_sarima12_pre.summary().tables[1])
+```
+Residual Check
+
+```{python}
+#| echo: false
+#| label: fig-acf-residual12-pre
+#| fig-cap: "Sample Autocorrelation function plot of SARIMA12 residuals"
+fig, ax = plt.subplots(figsize=(4, 2))
+plot_acf(crime_sarima12_pre.resid, ax = ax, lags=20, bartlett_confint=False)
+plt.xlabel('Lag'); plt.ylabel('Sample Autocorrelation')
+plt.tight_layout(); plt.show()
+```
+
+
+DURING
+
+```{python}
+monthly_incident_count = during_covid['Incidents']
+
+crime_sarima1_dur = SARIMAX(monthly_incident_count, order=(1,0,0), trend='c',seasonal_order=(1, 1, 0, 12)).fit()
+
+crime_sarima2_dur = SARIMAX(monthly_incident_count, order=(0,0,1), trend='c',seasonal_order=(0, 1, 1, 12)).fit()
+
+crime_sarima3_dur = SARIMAX(monthly_incident_count, order=(1,0,1), trend='c',seasonal_order=(1, 1, 1, 12)).fit()
+
+crime_sarima4_dur = SARIMAX(monthly_incident_count, order=(1,0,0), trend='c',seasonal_order=(2, 1, 0, 12)).fit()
+
+crime_sarima5_dur = SARIMAX(monthly_incident_count, order=(0,0,1), trend='c',seasonal_order=(1, 1, 0, 12)).fit()
+
+crime_sarima6_dur = SARIMAX(monthly_incident_count, order=(1,0,0), trend='c',seasonal_order=(1, 1, 1, 12)).fit()
+
+crime_sarima7_dur = SARIMAX(monthly_incident_count, order=(1,0,0), trend='c',seasonal_order=(0, 1, 1, 12)).fit()
+
+crime_sarima8_dur = SARIMAX(monthly_incident_count, order=(1,1,1), trend='c',seasonal_order=(1, 1, 1, 12)).fit()
+
+crime_sarima9_dur = SARIMAX(monthly_incident_count, order=(1,0,0), trend='c', seasonal_order=(1, 0, 0,12)).fit()
+
+crime_sarima10_dur = SARIMAX(monthly_incident_count, order=(1,0,0), trend='c', seasonal_order=(1, 1, 0, 12)).fit()
+
+crime_sarima11_dur = SARIMAX(monthly_incident_count, order=(1,0,0), trend='c', seasonal_order=(0, 1, 0,12)).fit()
+
+crime_sarima12_dur = SARIMAX(monthly_incident_count, order=(0,1,1), trend='c', seasonal_order=(0, 1, 1,12)).fit()
+
+crime_sarima13_dur = SARIMAX(monthly_incident_count, order=(1,0,0), trend='c', seasonal_order=(0, 0, 0, 12)).fit()
+
+crime_sarima13_dur = SARIMAX(monthly_incident_count, order=(1,0,0), trend='c', seasonal_order=(0, 0, 1, 12)).fit()
+
+crime_sarima14_dur = SARIMAX(monthly_incident_count, order=(1,0,0), trend='c', seasonal_order=(0, 0, 0, 12)).fit()
+
+crime_sarima15_dur = SARIMAX(monthly_incident_count, order=(1,0,0), trend='c', seasonal_order=(0, 1, 0, 12)).fit()
+```
+
+Check AIC
+```{python}
+#| echo: false
+crime_sarima1_dur.aic.item()
+crime_sarima2_dur.aic.item() 
+crime_sarima3_dur.aic.item()
+crime_sarima4_dur.aic.item() 
+crime_sarima5_dur.aic.item()
+crime_sarima6_dur.aic.item()
+crime_sarima7_dur.aic.item()
+crime_sarima8_dur.aic.item() 
+crime_sarima9_dur.aic.item() 
+crime_sarima10_dur.aic.item()
+crime_sarima11_dur.aic.item()
+crime_sarima12_dur.aic.item() 
+crime_sarima13_dur.aic.item() 
+crime_sarima14_dur.aic.item()
+crime_sarima15_dur.aic.item()
+```
+```{python}
+print(crime_sarima11_dur.summary().tables[1])
+print(crime_sarima13_dur.summary().tables[1])
+print(crime_sarima14_dur.summary().tables[1])
+print(crime_sarima15_dur.summary().tables[1])
+print(crime_sarima12_dur.summary().tables[1]) # why does this have the best acf plot despite not having significant coeff
+```
+
+
+Roots
+
+```{python}
+ar_roots = crime_sarima11_dur.arroots
+print("Magnitude of AR roots:", np.abs(ar_roots))
+
+ma_roots = crime_sarima11_dur.maroots
+print("Magnitude of MA roots > 1.1:", np.abs(ma_roots) > 1.1)
+print("Magnitude of MA roots:", np.abs(ma_roots)) ## Too close to boundary
+
+ar_roots = crime_sarima13_dur.arroots
+print("Magnitude of AR roots:", np.abs(ar_roots))
+
+ma_roots = crime_sarima13_dur.maroots
+print("Magnitude of MA roots > 1.1:", np.abs(ma_roots) > 1.1)
+print("Magnitude of MA roots:", np.abs(ma_roots)) ## Too close to boundary
+
+ar_roots = crime_sarima14_dur.arroots
+print("Magnitude of AR roots:", np.abs(ar_roots))
+
+ar_roots = crime_sarima15_dur.arroots
+print("Magnitude of AR roots:", np.abs(ar_roots))  # Too close to boundary
+```
+```{python}
+#| echo: false
+#| label: fig-acf-residual11-during
+#| fig-cap: "Sample Autocorrelation function plot of SARIMA11 residuals"
+fig, ax = plt.subplots(figsize=(4, 2))
+plot_acf(crime_sarima11_dur.resid, ax = ax, lags=20, bartlett_confint=False)
+plt.xlabel('Lag'); plt.ylabel('Sample Autocorrelation')
+plt.tight_layout(); plt.show()
+```
+
+```{python}
+#| echo: false
+#| label: fig-acf-residual13-during
+#| fig-cap: "Sample Autocorrelation function plot of SARIMA13 residuals"
+fig, ax = plt.subplots(figsize=(4, 2))
+plot_acf(crime_sarima13_dur.resid, ax = ax, lags=20, bartlett_confint=False)
+plt.xlabel('Lag'); plt.ylabel('Sample Autocorrelation')
+plt.tight_layout(); plt.show()
+```
+
+```{python}
+#| echo: false
+#| label: fig-acf-residual14-during
+#| fig-cap: "Sample Autocorrelation function plot of SARIMA14 residuals"
+fig, ax = plt.subplots(figsize=(4, 2))
+plot_acf(crime_sarima14_dur.resid, ax = ax, lags=20, bartlett_confint=False)
+plt.xlabel('Lag'); plt.ylabel('Sample Autocorrelation')
+plt.tight_layout(); plt.show()
+```
+
+since SARIMA15 does not capture seasonality
+```{python}
+#| echo: false
+#| label: fig-acf-residual15-during
+#| fig-cap: "Sample Autocorrelation function plot of SARIMA15 residuals"
+fig, ax = plt.subplots(figsize=(4, 2))
+plot_acf(crime_sarima15_dur.resid, ax = ax, lags=20, bartlett_confint=False)
+plt.xlabel('Lag'); plt.ylabel('Sample Autocorrelation')
+plt.tight_layout(); plt.show()
+```
+POST
+
+```{python}
+monthly_incident_count = post_covid['Incidents']
+
+crime_sarima1_post = SARIMAX(monthly_incident_count, order=(1,0,0), trend='c',seasonal_order=(1, 1, 0, 12)).fit()
+
+crime_sarima2_post = SARIMAX(monthly_incident_count, order=(0,0,1), trend='c',seasonal_order=(0, 1, 1, 12)).fit()
+
+crime_sarima3_post = SARIMAX(monthly_incident_count, order=(1,0,1), trend='c',seasonal_order=(1, 1, 1, 12)).fit()
+
+crime_sarima4_post = SARIMAX(monthly_incident_count, order=(1,0,0), trend='c',seasonal_order=(2, 1, 0, 12)).fit()
+
+crime_sarima5_post = SARIMAX(monthly_incident_count, order=(0,0,1), trend='c',seasonal_order=(1, 1, 0, 12)).fit()
+
+crime_sarima6_post = SARIMAX(monthly_incident_count, order=(1,0,0), trend='c',seasonal_order=(1, 1, 1, 12)).fit()
+
+crime_sarima7_post = SARIMAX(monthly_incident_count, order=(1,0,0), trend='c',seasonal_order=(0, 1, 1, 12)).fit()
+
+crime_sarima8_post = SARIMAX(monthly_incident_count, order=(1,1,1), trend='c',seasonal_order=(1, 1, 1, 12)).fit()
+
+crime_sarima9_post = SARIMAX(monthly_incident_count, order=(1,0,0), trend='c', seasonal_order=(1, 0, 0,12)).fit()
+
+crime_sarima10_post = SARIMAX(monthly_incident_count, order=(1,0,0), trend='c', seasonal_order=(1, 1, 0, 12)).fit()
+
+crime_sarima11_post = SARIMAX(monthly_incident_count, order=(1,0,0), trend='c', seasonal_order=(0, 1, 0,12)).fit()
+
+crime_sarima12_post = SARIMAX(monthly_incident_count, order=(0,1,1), trend='c', seasonal_order=(0, 1, 1,12)).fit()
+
+crime_sarima13_post = SARIMAX(monthly_incident_count, order=(1,0,0), trend='c', seasonal_order=(0, 0, 0, 12)).fit()
+
+crime_sarima13_post = SARIMAX(monthly_incident_count, order=(1,0,0), trend='c', seasonal_order=(0, 0, 1, 12)).fit()
+
+crime_sarima14_post = SARIMAX(monthly_incident_count, order=(1,0,0), trend='c', seasonal_order=(0, 0, 0, 12)).fit()
+
+crime_sarima15_post = SARIMAX(monthly_incident_count, order=(1,0,0), trend='c', seasonal_order=(0, 1, 0, 12)).fit()
+```
+
+Check AIC
+```{python}
+#| echo: false
+crime_sarima1_post.aic.item()
+crime_sarima2_post.aic.item() 
+crime_sarima3_post.aic.item()
+crime_sarima4_post.aic.item() 
+crime_sarima5_post.aic.item()
+crime_sarima6_post.aic.item()
+crime_sarima7_post.aic.item()
+crime_sarima8_post.aic.item() 
+crime_sarima9_post.aic.item() 
+crime_sarima10_post.aic.item()
+crime_sarima11_post.aic.item()
+crime_sarima12_post.aic.item() 
+crime_sarima13_post.aic.item() 
+crime_sarima14_post.aic.item()
+crime_sarima15_post.aic.item()
+```
+
+```{python}
+# print(crime_sarima6_post.summary().tables[1]) # intercept insignificant
+print(crime_sarima9_post.summary().tables[1]) 
+print(crime_sarima11_post.summary().tables[1]) # best AIC
+print(crime_sarima13_post.summary().tables[1])
+print(crime_sarima14_post.summary().tables[1])
+print(crime_sarima15_post.summary().tables[1])
+print(crime_sarima12_post.summary().tables[1]) # again, this shows the most reasonable ACF
+```
+
+Check Roots
+```{python}
+
+ar_roots = crime_sarima6_post.arroots
+print("Magnitude of AR roots:", np.abs(ar_roots)) # Too close to boundary
+
+ma_roots = crime_sarima6_post.maroots
+print("Magnitude of MA roots > 1.1:", np.abs(ma_roots) > 1.1)
+print("Magnitude of MA roots:", np.abs(ma_roots)) # Too close to boundary
+
+ar_roots = crime_sarima9_post.arroots
+print("Magnitude of AR roots:", np.abs(ar_roots)) # Too close to boundary
+
+ar_roots = crime_sarima11_post.arroots
+print("Magnitude of AR roots:", np.abs(ar_roots)) # Too close to boundary
+
+ar_roots = crime_sarima13_post.arroots
+print("Magnitude of AR roots:", np.abs(ar_roots))
+
+ma_roots = crime_sarima13_post.maroots
+print("Magnitude of MA roots > 1.1:", np.abs(ma_roots) > 1.1)
+print("Magnitude of MA roots:", np.abs(ma_roots)) # Too close to boundary
+
+ar_roots = crime_sarima14_post.arroots
+print("Magnitude of AR roots:", np.abs(ar_roots))
+
+ar_roots = crime_sarima15_post.arroots
+print("Magnitude of AR roots:", np.abs(ar_roots))
+
+```
+```{python}
+#| echo: false
+#| label: fig-acf-residual6-post
+#| fig-cap: "Sample Autocorrelation function plot of SARIMA6 residuals"
+fig, ax = plt.subplots(figsize=(4, 2))
+plot_acf(crime_sarima6_post.resid, ax = ax, lags=20, bartlett_confint=False)
+plt.xlabel('Lag'); plt.ylabel('Sample Autocorrelation')
+plt.tight_layout(); plt.show()
+```
+
+```{python}
+#| echo: false
+#| label: fig-acf-residual9-post
+#| fig-cap: "Sample Autocorrelation function plot of SARIMA9 residuals"
+fig, ax = plt.subplots(figsize=(4, 2))
+plot_acf(crime_sarima9_post.resid, ax = ax, lags=20, bartlett_confint=False)
+plt.xlabel('Lag'); plt.ylabel('Sample Autocorrelation')
+plt.tight_layout(); plt.show()
+```
+
+```{python}
+#| echo: false
+#| label: fig-acf-residual11-post
+#| fig-cap: "Sample Autocorrelation function plot of SARIMA11 residuals"
+fig, ax = plt.subplots(figsize=(4, 2))
+plot_acf(crime_sarima11_post.resid, ax = ax, lags=20, bartlett_confint=False)
+plt.xlabel('Lag'); plt.ylabel('Sample Autocorrelation')
+plt.tight_layout(); plt.show()
+```
+
+```{python}
+#| echo: false
+#| label: fig-acf-residual13-post
+#| fig-cap: "Sample Autocorrelation function plot of SARIMA13 residuals"
+fig, ax = plt.subplots(figsize=(4, 2))
+plot_acf(crime_sarima13_post.resid, ax = ax, lags=20, bartlett_confint=False)
+plt.xlabel('Lag'); plt.ylabel('Sample Autocorrelation')
+plt.tight_layout(); plt.show()
+```
+
+
+```{python}
+#| echo: false
+#| label: fig-acf-residual14-post
+#| fig-cap: "Sample Autocorrelation function plot of SARIMA14 residuals"
+fig, ax = plt.subplots(figsize=(4, 2))
+plot_acf(crime_sarima14_post.resid, ax = ax, lags=20, bartlett_confint=False)
+plt.xlabel('Lag'); plt.ylabel('Sample Autocorrelation')
+plt.tight_layout(); plt.show()
+```
+
+```{python}
+#| echo: false
+#| label: fig-acf-residual15-post
+#| fig-cap: "Sample Autocorrelation function plot of SARIMA15 residuals"
+fig, ax = plt.subplots(figsize=(4, 2))
+plot_acf(crime_sarima15_post.resid, ax = ax, lags=20, bartlett_confint=False)
+plt.xlabel('Lag'); plt.ylabel('Sample Autocorrelation')
+plt.tight_layout(); plt.show()
+```
+```{python}
+#| echo: false
+#| label: fig-acf-residual12-post
+#| fig-cap: "Sample Autocorrelation function plot of SARIMA12 residuals" # this one had insignificant coefficients
+fig, ax = plt.subplots(figsize=(4, 2))
+plot_acf(crime_sarima12_post.resid, ax = ax, lags=20, bartlett_confint=False)
+plt.xlabel('Lag'); plt.ylabel('Sample Autocorrelation')
+plt.tight_layout(); plt.show()
+```
+
+
+Questions to ask:
+1) Why do we see insignificant coeffcicients in some cases, but the ACF plot shows iid residuals. 
+
+
+# Unemployment Data
+
+**Exploratory Data Analysis**
+
+**Check Roots**
+
+**Residual Analysis**
