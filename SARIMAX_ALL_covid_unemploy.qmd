@@ -1,0 +1,744 @@
+---
+title: "SARIMAX (Covid, Unemployment)"
+format: html
+number-sections: true
+jupyter: python3
+python: ~/venv/bin/python3
+---
+
+Load in Python libraries.
+
+```{python}
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from statsmodels.tsa.arima.model import ARIMA
+import statsmodels.api as sm
+from statsmodels.tsa.statespace.sarimax import SARIMAX
+from statsmodels.graphics.tsaplots import plot_acf
+from statsmodels.nonparametric.smoothers_lowess import lowess
+import warnings
+warnings.filterwarnings('ignore')
+```
+
+Load in Data. Impute missing values.
+
+```{python}
+# crime 
+crime = pd.read_csv("rms_crime_incidents.csv")
+
+# unemployment
+unemployment = pd.read_csv('unemployment_wayne_county.csv')
+
+# missing value
+missing = unemployment.index[unemployment['Value'] == '-'][0]
+before_missing = unemployment['Value'][missing - 1]
+after_missing =  unemployment['Value'][missing + 1]
+avg = (pd.to_numeric(before_missing) + pd.to_numeric(after_missing)) / 2
+unemployment['Value'] = unemployment['Value'].replace('-', avg)
+unemployment['Value'] = pd.to_numeric(unemployment['Value'])
+```
+
+Crime data cleaning.
+
+```{python}
+crime['incident_occurred_at'] = pd.to_datetime(crime['incident_occurred_at'])
+
+# monthly period
+crime['Month'] = crime['incident_occurred_at'].dt.to_period('M')
+
+# aggregate counts over each month and year starting from 2017
+crime_monthly = crime.groupby('Month').size().reset_index(name='Incidents')
+crime_monthly['Month'] = crime_monthly['Month'].dt.to_timestamp()
+crime_monthly = crime_monthly[crime_monthly['Month'].dt.year >= 2017]
+
+# log transform crime
+crime_monthly['log_Incidents'] = np.log(crime_monthly['Incidents']) 
+```
+
+Unemployment data cleaning.
+
+```{python}
+unemployment['Label'] =  pd.to_datetime(unemployment['Label'])
+unemployment['Label'] = unemployment['Label'].dt.to_period('M')
+unemployment['Label'] = unemployment['Label'].dt.to_timestamp()
+unemployment = unemployment[unemployment['Label'].dt.year >= 2017]
+unemployment['log_Rate'] = np.log(unemployment['Value']) 
+```
+
+Covid labels.
+
+```{python}
+edges = [pd.Timestamp("2017-01-01"),pd.Timestamp("2020-03-01",), pd.Timestamp("2022-07-01"), pd.Timestamp("2026-01-01")] #since unemployment limited to 2025
+
+labels = ["pre", "during", "post"]
+
+crime_monthly["covid"] = pd.cut(crime_monthly["Month"], bins=edges, labels=labels, right=False)
+crime_monthly = crime_monthly.dropna()
+unemployment["covid"] = pd.cut(unemployment["Label"], bins=edges, labels=labels, right=False)
+```
+
+# Unemployment and covid
+
+Exogenous dataframe with unemployment and covid
+
+```{python}
+covid_dummy = pd.get_dummies(crime_monthly["covid"], drop_first=True).astype(float)
+
+covid_dummy_during = covid_dummy['during'].reset_index(drop=True)
+covid_dummy_post   = covid_dummy['post'].reset_index(drop=True)
+
+no_of_incidents = crime_monthly['log_Incidents'].reset_index(drop=True)
+unemployment_values = unemployment['Value'].reset_index(drop=True)
+
+exog_vars = pd.concat([covid_dummy[['during','post']].reset_index(drop=True),
+unemployment_values.reset_index(drop=True)],axis=1)
+
+exog_vars.columns = ['covid_during', 'covid_post', 'unemployment']
+
+
+# Checks to see if indexing was correct
+# covid_dummy_during.index
+# covid_dummy_post.index
+# unemployment_values.index
+
+print(exog_vars.isna().sum())
+print(no_of_incidents.isna().sum())
+
+len(no_of_incidents)
+len(exog_vars)
+
+print(exog_vars['unemployment'].isna().sum())
+print(unemployment_values.isna().sum())
+print(covid_dummy_during.index.equals(unemployment_values.index))
+```
+
+## Modeling with linear Trend
+
+```{python}
+def sarima_aic_table(data, p_max, q_max, P_max, Q_max, m):
+    results = []
+    # Iterate through all combinations
+    for p in range(p_max + 1):
+        for q in range(q_max + 1):
+            for P in range(P_max + 1):
+                for Q in range(Q_max + 1):
+                    try:
+                        model = SARIMAX(data, order=(p,0,q), trend='t',
+                        seasonal_order=(P, 0, Q, m), exog = exog_vars)
+                        results_fit = model.fit(disp=False)
+                        results.append([p, q, P, Q, results_fit.aic])
+                    except:
+                        results.append([p, q, P, Q, np.nan])
+                        
+    # Create DataFrame
+    df = pd.DataFrame(results, columns=['AR(p)', 'MA(q)', 'SAR(P)', 'SMA(Q)', 'AIC'])
+    df.sort_values(by='AIC')
+    # Sort by AIC ascending
+    return df.sort_values(by='AIC')
+
+sarima_results = sarima_aic_table(no_of_incidents, 2, 2, 2, 2, 12)
+sarima_results.head(20)
+```
+
+```{python}
+#| fig-cap: "Time plot of log_Incidents per Month"
+
+# Plot
+plt.figure(figsize=(5, 2))
+plt.title("Monthly Crime Incidents during Covid")
+plt.plot(crime_monthly['Month'], crime_monthly['log_Incidents'], '-')
+plt.xlabel('Month')
+plt.ylabel('log_Incidents per Month')
+plt.tight_layout()
+plt.show()
+```
+
+```{python}
+
+#| label: fig-acf-incidents-during
+#| fig-cap: "Sample Autocorrelation function of log_Incidents"
+
+fig, ax = plt.subplots(figsize=(5, 2))
+plot_acf(crime_monthly['log_Incidents'], ax = ax, lags=20, bartlett_confint=False)
+plt.xlabel('Lag'); plt.ylabel('Sample Autocorrelation')
+plt.tight_layout(); plt.show()
+```
+
+AR1 SAR2
+```{python}
+ar1sar2 = SARIMAX(no_of_incidents, order=(1,0,0), trend='t', exog = exog_vars,seasonal_order=(2, 0, 0, 12)).fit()
+
+print(ar1sar2.summary().tables[1]) # not enough evidence for the drift.
+
+ar_roots = ar1sar2.arroots
+print("Magnitude of AR roots:", np.abs(ar_roots)) # Possibly too close to boundary. 
+print("Magnitude of AR roots > 1.1:", np.abs(ar_roots) > 1.1)
+```
+
+AR1: Unit roots
+
+AR1 SAR1
+```{python}
+ar1sar1 = SARIMAX(no_of_incidents, order=(1,0,0), trend='t', exog = exog_vars,seasonal_order=(1, 0, 0, 12)).fit()
+
+print(ar1sar1.summary().tables[1]) # not enough evidence for the drift or employment
+
+ar_roots = ar1sar1.arroots
+print("Magnitude of AR roots:", np.abs(ar_roots)) # Close to boundary
+print("Magnitude of AR roots > 1.1:", np.abs(ar_roots) > 1.1)
+```
+
+AR1 SMA1: Unit roots
+
+## Added after log transformation
+AR1 SAR2:
+
+```{python}
+model = SARIMAX(no_of_incidents, order=(1,0,1), trend='t', exog = exog_vars, seasonal_order=(1, 0, 0, 12)).fit()
+
+print(model.summary().tables[1])
+
+ar_roots = model.arroots
+print("Magnitude of AR roots:", np.abs(ar_roots))
+print("Magnitude of AR roots > 1.1:", np.abs(ar_roots) > 1.1)
+
+ma_roots = model.maroots
+print("Magnitude of MA roots:", np.abs(ma_roots))
+print("Magnitude of MA roots > 1.1:", np.abs(ma_roots) > 1.1)
+```
+
+```{python}
+#| fig-cap: "Sample Autocorrelation function"
+
+fig, ax = plt.subplots(figsize=(5, 2))
+plot_acf(model.resid, ax = ax, lags=20, bartlett_confint=False)
+plt.xlabel('Lag'); plt.ylabel('Sample Autocorrelation')
+plt.tight_layout(); plt.show()
+
+plt.figure(figsize=(5, 2))
+plt.title("Residuals of AR1SAR1")
+plt.plot(crime_monthly['Month'], model.resid, '-')
+plt.xlabel('Month')
+plt.ylabel('Residuals')
+plt.tight_layout()
+plt.show()
+
+residualsdf = pd.DataFrame({'Month': (crime_monthly['Month']).reset_index(drop=True), 'Residual':(model.resid).reset_index(drop=True)})
+
+residualsdf.loc[residualsdf['Residual'].abs().nlargest(3).index]
+```
+
+```{python}
+resid_shifted = model.resid[1:]
+model.resid.sort_values().tail()
+resid_shifted.sort_values().tail()
+
+sm.qqplot(resid_shifted, line = 's')
+plt.title('Q-Q Plot for Normality Test')
+plt.xlabel('Theoretical Quantiles (Normal Distribution)')
+plt.ylabel('Sample Quantiles (Observed Data)')
+plt.show()
+
+#crime_monthly['Month'][crime_monthly.reset_index().index == 50]
+```
+
+## Modeling with constant mean
+
+```{python}
+def sarima_aic_table(data, p_max, q_max, P_max, Q_max, m):
+    results = []
+    # Iterate through all combinations
+    for p in range(p_max + 1):
+        for q in range(q_max + 1):
+            for P in range(P_max + 1):
+                for Q in range(Q_max + 1):
+                    try:
+                        model = SARIMAX(data, order=(p,0,q), trend='c',
+                        seasonal_order=(P, 0, Q, m), exog = exog_vars)
+                        results_fit = model.fit(disp=False)
+                        results.append([p, q, P, Q, results_fit.aic])
+                    except:
+                        results.append([p, q, P, Q, np.nan])
+                        
+    # Create DataFrame
+    df = pd.DataFrame(results, columns=['AR(p)', 'MA(q)', 'SAR(P)', 'SMA(Q)', 'AIC'])
+    df.sort_values(by='AIC')
+    # Sort by AIC ascending
+    return df.sort_values(by='AIC')
+
+sarima_results = sarima_aic_table(no_of_incidents, 2, 2, 2, 2, 12)
+print(sarima_results.head())
+```
+
+AR1 SAR2
+
+```{python}
+ar1sar2 = SARIMAX(no_of_incidents, order=(1,0,0), trend='c', exog = exog_vars,seasonal_order=(2, 0, 0, 12)).fit()
+
+print(ar1sar2.summary().tables[1]) # not enough evidence for covid_during or unemployment
+
+ar_roots = ar1sar2.arroots
+print("Magnitude of AR roots:", np.abs(ar_roots)) # Possibly too close to boundary. 
+print("Magnitude of AR roots > 1.1:", np.abs(ar_roots) > 1.1)
+```
+
+AR2 SAR2
+
+```{python}
+ar2sar2 = SARIMAX(no_of_incidents, order=(2,0,0), trend='c', exog = exog_vars,seasonal_order=(2, 0, 0, 12)).fit()
+
+print(ar2sar2.summary().tables[1]) # not enough for mean, covid during, unemployment, or ar.L2
+
+ar_roots = ar2sar2.arroots
+print("Magnitude of AR roots:", np.abs(ar_roots)) # Possibly too close to boundary. 
+print("Magnitude of AR roots > 1.1:", np.abs(ar_roots) > 1.1)
+```
+
+AR1 SAR1
+
+```{python}
+ar1sar1 = SARIMAX(no_of_incidents, order=(1,0,0), trend='c', exog = exog_vars,seasonal_order=(1, 0, 0, 12)).fit()
+
+print(ar1sar1.summary().tables[1]) # not enough for mean, covid during, or unemployment
+
+ar_roots = ar1sar1.arroots
+print("Magnitude of AR roots:", np.abs(ar_roots)) # Farthest from boundary so far...
+print("Magnitude of AR roots > 1.1:", np.abs(ar_roots) > 1.1)
+```
+
+AR1 SMA2
+
+```{python}
+ar1sma2= SARIMAX(no_of_incidents, order=(1,0,0), trend='c', exog = exog_vars,seasonal_order=(0, 0, 2, 12)).fit()
+
+print(ar1sma2.summary().tables[1]) # not enough for mean, covid during, unemployment
+
+ar_roots = ar1sma2.arroots
+print("Magnitude of AR roots:", np.abs(ar_roots)) # Same as above, around 1.05
+print("Magnitude of AR roots > 1.1:", np.abs(ar_roots) > 1.1)
+
+ma_roots = ar1sma2.maroots
+print("Magnitude of MA roots:", np.abs(ma_roots)) # Same as above, around 1.05
+print("Magnitude of MA roots > 1.1:", np.abs(ma_roots) > 1.1)
+```
+
+AR1 SMA2
+
+```{python}
+ar1ma1sar1= SARIMAX(no_of_incidents, order=(1,0,1), trend='c', exog = exog_vars,seasonal_order=(1, 0, 0, 12)).fit()
+
+print(ar1ma1sar1.summary().tables[1]) # not enough for mean, covid_during, ma.L1 
+
+ar_roots = ar1ma1sar1.arroots
+print("Magnitude of AR roots:", np.abs(ar_roots)) # 1.08 not too bad
+print("Magnitude of AR roots > 1.1:", np.abs(ar_roots) > 1.1)
+
+ma_roots = ar1ma1sar1.maroots
+print("Magnitude of MA roots:", np.abs(ma_roots)) 
+print("Magnitude of MA roots > 1.1:", np.abs(ma_roots) > 1.1) # These look good too
+```
+
+# Covid only
+
+## Modeling with linear trend
+
+```{python}
+exog_covid = exog_vars[['covid_during', 'covid_post']]
+
+def sarima_aic_table(data, p_max, q_max, P_max, Q_max, m):
+    results = []
+    # Iterate through all combinations
+    for p in range(p_max + 1):
+        for q in range(q_max + 1):
+            for P in range(P_max + 1):
+                for Q in range(Q_max + 1):
+                    try:
+                        model = SARIMAX(data, order=(p,0,q), trend='t',
+                        seasonal_order=(P, 0, Q, m), exog = exog_covid)
+                        results_fit = model.fit(disp=False)
+                        results.append([p, q, P, Q, results_fit.aic])
+                    except:
+                        results.append([p, q, P, Q, np.nan])
+                        
+    # Create DataFrame
+    df = pd.DataFrame(results, columns=['AR(p)', 'MA(q)', 'SAR(P)', 'SMA(Q)', 'AIC'])
+    df.sort_values(by='AIC')
+    # Sort by AIC ascending
+    return df.sort_values(by='AIC')
+
+sarima_results = sarima_aic_table(no_of_incidents, 2, 2, 2, 2, 12)
+sarima_results.head(10)
+```
+
+AR1 (Unit root)
+
+```{python}
+ar1= SARIMAX(no_of_incidents, order=(1,0,0), trend='t', exog = exog_covid,seasonal_order=(0, 0, 0, 12)).fit()
+
+print(ar1.summary().tables[1])
+
+ar_roots = ar1.arroots
+print("Magnitude of AR roots:", np.abs(ar_roots)) # On boundary
+print("Magnitude of AR roots > 1.1:", np.abs(ar_roots) > 1.1)
+
+```
+
+AR1 MA1 SAR1
+
+```{python}
+ar1ma1sar1= SARIMAX(no_of_incidents, order=(1,0,1), trend='t', exog = exog_covid,seasonal_order=(1, 0, 0, 12)).fit()
+
+print(ar1ma1sar1.summary().tables[1])
+
+ar_roots = ar1ma1sar1.arroots
+print("Magnitude of AR roots:", np.abs(ar_roots)) 
+print("Magnitude of AR roots > 1.1:", np.abs(ar_roots) > 1.1)
+
+ma_roots = ar1ma1sar1.maroots
+print("Magnitude of MA roots:", np.abs(ma_roots)) 
+print("Magnitude of MA roots > 1.1:", np.abs(ma_roots) > 1.1)
+```
+
+AR2 SMA2 (Potential unit roots)
+
+```{python}
+ar2sma2= SARIMAX(no_of_incidents, order=(2,0,0), trend='t', exog = exog_covid,seasonal_order=(0, 0, 2, 12)).fit()
+
+print(ar2sma2.summary().tables[1])
+
+ar_roots = ar2sma2.arroots
+print("Magnitude of AR roots:", np.abs(ar_roots)) 
+print("Magnitude of AR roots > 1.1:", np.abs(ar_roots) > 1.1)
+
+ma_roots = ar2sma2.maroots
+print("Magnitude of MA roots:", np.abs(ma_roots)) 
+print("Magnitude of MA roots > 1.1:", np.abs(ma_roots) > 1.1)
+```
+
+AR2 MA1 SAR1
+
+```{python}
+ar2ma1sar1= SARIMAX(no_of_incidents, order=(2,0,1), trend='t', exog = exog_covid,seasonal_order=(1, 0, 0, 12)).fit()
+
+print(ar2ma1sar1.summary().tables[1])
+
+ar_roots = ar2ma1sar1.arroots
+print("Magnitude of AR roots:", np.abs(ar_roots)) 
+print("Magnitude of AR roots > 1.1:", np.abs(ar_roots) > 1.1)
+
+ma_roots = ar2ma1sar1.maroots
+print("Magnitude of MA roots:", np.abs(ma_roots)) 
+print("Magnitude of MA roots > 1.1:", np.abs(ma_roots) > 1.1)
+```
+
+AR1 MA1 SMA1
+
+```{python}
+ar1ma1sma1= SARIMAX(no_of_incidents, order=(1,0,1), trend='t', exog = exog_covid,seasonal_order=(0, 0, 1, 12)).fit()
+
+print(ar1ma1sma1.summary().tables[1])
+
+ar_roots = ar1ma1sma1.arroots
+print("Magnitude of AR roots:", np.abs(ar_roots)) 
+print("Magnitude of AR roots > 1.1:", np.abs(ar_roots) > 1.1)
+
+ma_roots = ar1ma1sma1.maroots
+print("Magnitude of MA roots:", np.abs(ma_roots)) 
+print("Magnitude of MA roots > 1.1:", np.abs(ma_roots) > 1.1)
+```
+
+AR1 SMA1 (Unit roots)
+
+```{python}
+ar1sma1 = SARIMAX(no_of_incidents, order=(1,0,0), trend='t', exog = exog_covid,seasonal_order=(0, 0, 1, 12)).fit()
+
+print(ar1sma1.summary().tables[1])
+
+ar_roots = ar1sma1.arroots
+print("Magnitude of AR roots:", np.abs(ar_roots)) 
+print("Magnitude of AR roots > 1.1:", np.abs(ar_roots) > 1.1)
+```
+
+AR2 SAR2 (Unit root issues)
+
+```{python}
+ar2sar2 = SARIMAX(no_of_incidents, order=(2,0,0), trend='t', exog = exog_covid,seasonal_order=(2, 0, 0, 12)).fit()
+
+print(ar2sar2.summary().tables[1])
+
+ar_roots = ar2sar2.arroots
+print("Magnitude of AR roots:", np.abs(ar_roots)) 
+print("Magnitude of AR roots > 1.1:", np.abs(ar_roots) > 1.1)
+```
+
+AR1 SAR2
+
+```{python}
+ar1sar2 = SARIMAX(no_of_incidents, order=(1,0,0), trend='t', exog = exog_covid,seasonal_order=(2, 0, 0, 12)).fit()
+
+print(ar1sar2.summary().tables[1])
+
+ar_roots = ar1sar2.arroots
+print("Magnitude of AR roots:", np.abs(ar_roots)) 
+print("Magnitude of AR roots > 1.1:", np.abs(ar_roots) > 1.1)
+
+
+plt.figure(figsize=(5, 2))
+plt.title("Residuals of AR1SAR1")
+plt.plot(crime_monthly['Month'], sarima_model.resid, '-')
+plt.xlabel('Month')
+plt.ylabel('Residuals')
+plt.tight_layout()
+plt.show()
+```
+
+## Modeling with constant mean
+
+```{python}
+def sarima_aic_table(data, p_max, q_max, P_max, Q_max, m):
+    results = []
+    # Iterate through all combinations
+    for p in range(p_max + 1):
+        for q in range(q_max + 1):
+            for P in range(P_max + 1):
+                for Q in range(Q_max + 1):
+                    try:
+                        model = SARIMAX(data, order=(p,0,q), trend='c',
+                        seasonal_order=(P, 0, Q, m), exog = exog_covid)
+                        results_fit = model.fit(disp=False)
+                        results.append([p, q, P, Q, results_fit.aic])
+                    except:
+                        results.append([p, q, P, Q, np.nan])
+                        
+    # Create DataFrame
+    df = pd.DataFrame(results, columns=['AR(p)', 'MA(q)', 'SAR(P)', 'SMA(Q)', 'AIC'])
+    df.sort_values(by='AIC')
+    # Sort by AIC ascending
+    return df.sort_values(by='AIC')
+
+sarima_results = sarima_aic_table(no_of_incidents, 2, 2, 2, 2, 12)
+print(sarima_results.head(10))
+```
+
+SMA 1 (This one is weird)
+```{python}
+sma1 = SARIMAX(no_of_incidents, order=(0,0,0), trend='c', exog = exog_covid, seasonal_order=(0, 0, 1, 12)).fit()
+
+print(sma1.summary().tables[1])
+
+ma_roots = sma1.maroots
+print("Magnitude of MA roots:", np.abs(ma_roots)) 
+print("Magnitude of MA roots > 1.1:", np.abs(ma_roots) > 1.1)
+```
+
+AR1 MA1 SAR1 (This model is feasible)
+```{python}
+ar1ma1sar1 = SARIMAX(no_of_incidents, order=(1,0,1), trend='c', exog = exog_covid, seasonal_order=(1, 0, 0, 12)).fit()
+
+print(ar1ma1sar1.summary().tables[1])
+
+ar_roots = ar1ma1sar1.arroots
+print("Magnitude of AR roots:", np.abs(ar_roots)) 
+print("Magnitude of AR roots > 1.1:", np.abs(ar_roots) > 1.1)
+
+ma_roots = ar1ma1sar1.maroots
+print("Magnitude of MA roots:", np.abs(ma_roots)) 
+print("Magnitude of MA roots > 1.1:", np.abs(ma_roots) > 1.1)
+```
+
+AR2 SMA2
+```{python}
+ar2sma2 = SARIMAX(no_of_incidents, order=(2,0,0), trend='c', exog = exog_covid, seasonal_order=(0, 0, 2, 12)).fit()
+
+print(ar2sma2.summary().tables[1])
+
+ar_roots = ar2sma2.arroots
+print("Magnitude of AR roots:", np.abs(ar_roots)) 
+print("Magnitude of AR roots > 1.1:", np.abs(ar_roots) > 1.1)
+
+ma_roots = ar2sma2.maroots
+print("Magnitude of MA roots:", np.abs(ma_roots)) 
+print("Magnitude of MA roots > 1.1:", np.abs(ma_roots) > 1.1)
+```
+
+AR2 SAR1 (Reasonable model)
+```{python}
+ar2sar1 = SARIMAX(no_of_incidents, order=(2,0,0), trend='c', exog = exog_covid, seasonal_order=(1, 0, 0, 12)).fit()
+
+print(ar2sar1.summary().tables[1])
+
+ar_roots = ar2sar1.arroots
+print("Magnitude of AR roots:", np.abs(ar_roots)) 
+print("Magnitude of AR roots > 1.1:", np.abs(ar_roots) > 1.1)
+```
+
+AR2 SMA1 (Reasonable model)
+```{python}
+ar2sma1 = SARIMAX(no_of_incidents, order=(2,0,0), trend='c', exog = exog_covid, seasonal_order=(0, 0, 1, 12)).fit()
+
+print(ar2sma1.summary().tables[1])
+
+ar_roots = ar2sma1.arroots
+print("Magnitude of AR roots:", np.abs(ar_roots)) 
+print("Magnitude of AR roots > 1.1:", np.abs(ar_roots) > 1.1)
+
+ma_roots = ar2sma1.maroots
+print("Magnitude of MA roots:", np.abs(ma_roots)) 
+print("Magnitude of MA roots > 1.1:", np.abs(ma_roots) > 1.1)
+```
+
+AR2 SAR2
+```{python}
+ar2sar2 = SARIMAX(no_of_incidents, order=(2,0,0), trend='c', exog = exog_covid, seasonal_order=(2, 0, 0, 12)).fit()
+
+print(ar2sar2.summary().tables[1])
+
+ar_roots = ar2sar2.arroots
+print("Magnitude of AR roots:", np.abs(ar_roots)) 
+print("Magnitude of AR roots > 1.1:", np.abs(ar_roots) > 1.1)
+```
+
+
+AR1 SAR1 (I just made this up but it looks like it works well except one residual)
+```{python}
+ar1sar1 = SARIMAX(no_of_incidents, order=(1, 0, 1), trend='t', exog = exog_covid, seasonal_order=(1, 0, 0, 12)).fit()
+
+print(ar1sar1.summary().tables[1])
+
+ar_roots = ar1sar1.arroots
+print("Magnitude of AR roots:", np.abs(ar_roots)) 
+print("Magnitude of AR roots > 1.1:", np.abs(ar_roots) > 1.1)
+
+ar1sar1.aic.item()
+```
+
+```{python}
+
+#| fig-cap: "Sample Autocorrelation function plot of ar1sar1 residuals"
+fig, ax = plt.subplots(figsize=(4, 2))
+plot_acf(ar1sar1.resid, ax = ax, lags=20, bartlett_confint=False)
+plt.xlabel('Lag'); plt.ylabel('Sample Autocorrelation')
+plt.tight_layout(); plt.show()
+
+plt.figure(figsize=(5, 2))
+plt.title("Residuals of AR1SAR1")
+plt.plot(crime_monthly['Month'], ar1sar1.resid, '-')
+plt.xlabel('Month')
+plt.ylabel('Residuals')
+plt.tight_layout()
+plt.show()
+```
+
+
+# Final models
+
+## For both variables:
+My guess: 
+
+Constant with differencing
+```{python}
+sarima_model = SARIMAX(no_of_incidents, order=(1, 1, 0), trend='c', exog = exog_vars, seasonal_order=(1, 0, 0, 12)).fit()
+
+print(sarima_model.summary().tables[1])
+
+ar_roots = sarima_model.arroots
+print("Magnitude of AR roots:", np.abs(ar_roots)) 
+
+ma_roots = sarima_model.maroots
+print("Magnitude of MA roots:", np.abs(ma_roots)) 
+
+#| fig-cap: "Sample Autocorrelation function plot of ar1sar1 residuals"
+fig, ax = plt.subplots(figsize=(4, 2))
+plot_acf(sarima_model.resid, ax = ax, lags=20, bartlett_confint=False)
+plt.xlabel('Lag'); plt.ylabel('Sample Autocorrelation')
+plt.tight_layout(); plt.show()
+
+plt.figure(figsize=(5, 2))
+plt.title("Residuals of AR1SAR1")
+plt.plot(crime_monthly['Month'], sarima_model.resid, '-')
+plt.xlabel('Month')
+plt.ylabel('Residuals')
+plt.tight_layout()
+plt.show()
+```
+
+Or, with linear trend:
+```{python}
+sarima_model = SARIMAX(no_of_incidents, order=(1, 0, 0), trend='t', exog = exog_vars, seasonal_order=(1, 0, 0, 12)).fit()
+
+print(sarima_model.summary().tables[1])
+
+ar_roots = sarima_model.arroots
+print("Magnitude of AR roots:", np.abs(ar_roots)) 
+
+ma_roots = sarima_model.maroots
+print("Magnitude of MA roots:", np.abs(ma_roots)) 
+
+#| fig-cap: "Sample Autocorrelation function plot of ar1sar1 residuals"
+fig, ax = plt.subplots(figsize=(4, 2))
+plot_acf(sarima_model.resid, ax = ax, lags=20, bartlett_confint=False)
+plt.xlabel('Lag'); plt.ylabel('Sample Autocorrelation')
+plt.tight_layout(); plt.show()
+
+plt.figure(figsize=(5, 2))
+plt.title("Residuals of AR1SAR1")
+plt.plot(crime_monthly['Month'], sarima_model.resid, '-')
+plt.xlabel('Month')
+plt.ylabel('Residuals')
+plt.tight_layout()
+plt.show()
+```
+
+```{python}
+def sarima_aic_table(data, p_max, q_max, P_max, Q_max, m):
+    results = []
+    # Iterate through all combinations
+    for p in range(p_max + 1):
+        for q in range(q_max + 1):
+            for P in range(P_max + 1):
+                for Q in range(Q_max + 1):
+                    try:
+                        model = SARIMAX(data, order=(p,0,q), trend='t',
+                        seasonal_order=(P, 0, Q, m), exog = exog_covid)
+                        results_fit = model.fit(disp=False)
+                        results.append([p, q, P, Q, results_fit.aic])
+                    except:
+                        results.append([p, q, P, Q, np.nan])
+                        
+    # Create DataFrame
+    df = pd.DataFrame(results, columns=['AR(p)', 'MA(q)', 'SAR(P)', 'SMA(Q)', 'AIC'])
+    df.sort_values(by='AIC')
+    # Sort by AIC ascending
+    return df.sort_values(by='AIC')
+
+sarima_results = sarima_aic_table(no_of_incidents, 3, 3, 3, 3, 12)
+print(sarima_results.head(10))
+```
+
+
+```{python}
+sarima_model = SARIMAX(no_of_incidents, order=(1, 0, 1), trend='t', exog = exog_vars, seasonal_order=(1, 0, 0, 12)).fit()
+
+print(sarima_model.summary().tables[1])
+
+ar_roots = sarima_model.arroots
+print("Magnitude of AR roots:", np.abs(ar_roots)) 
+
+ma_roots = sarima_model.maroots
+print("Magnitude of MA roots:", np.abs(ma_roots)) 
+
+#| fig-cap: "Sample Autocorrelation function plot of ar1sar1 residuals"
+fig, ax = plt.subplots(figsize=(4, 2))
+plot_acf(sarima_model.resid, ax = ax, lags=20, bartlett_confint=False)
+plt.xlabel('Lag'); plt.ylabel('Sample Autocorrelation')
+plt.tight_layout(); plt.show()
+
+plt.figure(figsize=(5, 2))
+plt.title("Residuals of AR1SAR1")
+plt.plot(crime_monthly['Month'], sarima_model.resid, '-')
+plt.xlabel('Month')
+plt.ylabel('Residuals')
+plt.tight_layout()
+plt.show()
+```
