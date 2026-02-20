@@ -1,0 +1,793 @@
+---
+title: "Analysis of Crime and Unemployment Time Series Post-Pandemic\\vspace{-2cm}"
+bibliography: references.bib
+output: pdf_document
+format:
+  pdf:
+    fig-pos: 'H'
+    include-in-header:
+      text: |
+        \RedeclareSectionCommand[
+          beforeskip=0.5em,
+          runin=false,
+          afterskip=0em
+        ]{section}
+        \RedeclareSectionCommand[
+          beforeskip=0em,
+          runin=false,
+          afterskip=0em
+        ]{subsection}
+        \RedeclareSectionCommand[
+          beforeskip=0em,
+          runin=false,
+          afterskip=0em
+        ]{subsubsection}
+        \usepackage{fullpage}
+number-sections: true
+fig-align: center
+jupyter: python3
+python: ~/venv/bin/python3
+---
+
+```{python dependencies}
+#| echo: false
+
+# Load in dependencies
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from statsmodels.tsa.arima.model import ARIMA
+import statsmodels.api as sm
+from statsmodels.tsa.statespace.sarimax import SARIMAX
+from statsmodels.graphics.tsaplots import plot_acf
+from statsmodels.graphics.tsaplots import plot_pacf
+from datetime import datetime
+import matplotlib.patches as patches
+from statsmodels.nonparametric.smoothers_lowess import lowess
+import itertools
+from concurrent.futures import ThreadPoolExecutor
+import shelve
+import warnings
+
+warnings.filterwarnings('ignore')
+```
+
+
+```{python read in data}
+#| echo: false
+# Loading in new data: 1990 - 2025
+unem_new = pd.read_csv("Monthly_Unemployment_Data.csv",  comment='#')
+crime_new = pd.read_csv("Monthly_Crime_Data.csv",  comment='#')
+```
+
+```{python violent crime set up}
+#| echo: false
+#SPLITTING UP MODELS BY DIFFRERENT TYPES OF CRIME: Violent Crime
+
+crime_new['Date'].head()
+
+crime_new["Date"] = pd.to_datetime(
+    crime_new["Date"],
+    utc=True
+)
+
+
+crime_ts_new = crime_new[
+    (crime_new["Date"] >= "1990-01-01") &
+    (crime_new["Date"] <  "2026-01-01")
+]
+
+
+monthly_counts_vio = (
+    crime_ts_new
+    .set_index("Date")["Violent_Crime"]
+    .resample("MS")
+    .sum()
+    .rename("violent")
+    .reset_index()
+)
+```
+
+```{python property crime set up}
+#| echo: false
+#SPLITTING UP MODELS BY DIFFRERENT TYPES OF CRIME: Property Crime
+
+crime_new['Date'].head()
+
+crime_new["Date"] = pd.to_datetime(
+    crime_new["Date"],
+    utc=True
+)
+
+
+crime_ts_new = crime_new[
+    (crime_new["Date"] >= "1990-01-01") &
+    (crime_new["Date"] <  "2026-01-01")
+]
+
+
+monthly_counts_prop = (
+    crime_ts_new
+    .set_index("Date")["Property_Crime"]
+    .resample("MS")
+    .sum()
+    .rename("property")
+    .reset_index()
+)
+```
+
+```{python covid indicator}
+#| echo: false
+#0 pre covid, 1 during covid, 2 post covid
+
+# VIOLENT CRIME
+monthly_counts_vio["covid"] = np.select(
+    [
+        monthly_counts_vio["Date"] < pd.Timestamp("2020-03-01", tz="UTC"),
+        (monthly_counts_vio["Date"] >= pd.Timestamp("2020-03-01", tz="UTC")) & (monthly_counts_vio["Date"] < pd.Timestamp("2022-07-01", tz="UTC")),
+        monthly_counts_vio["Date"] >= pd.Timestamp("2022-07-01", tz="UTC"),
+    ],
+    ["pre", "during", "post"],
+    default="unknown" 
+)
+
+
+
+monthly_counts_vio["covid"] = pd.Categorical(
+    monthly_counts_vio["covid"],
+    categories=["pre", "during", "post"],
+    ordered=True
+)
+
+X = pd.get_dummies(monthly_counts_vio["covid"], drop_first=True).astype(float)
+
+
+#PROPERTY CRIME
+
+monthly_counts_prop["covid"] = np.select(
+    [
+        monthly_counts_prop["Date"] < pd.Timestamp("2020-03-01", tz="UTC"),
+        (monthly_counts_prop["Date"] >= pd.Timestamp("2020-03-01", tz="UTC")) & (monthly_counts_prop["Date"] < pd.Timestamp("2022-07-01", tz="UTC")),
+        monthly_counts_prop["Date"] >= pd.Timestamp("2022-07-01", tz="UTC"),
+    ],
+    ["pre", "during", "post"],
+    default="unknown" 
+)
+
+
+
+monthly_counts_prop["covid"] = pd.Categorical(
+    monthly_counts_prop["covid"],
+    categories=["pre", "during", "post"],
+    ordered=True
+)
+
+X = pd.get_dummies(monthly_counts_prop["covid"], drop_first=True).astype(float)
+```
+
+```{python violent with exog}
+#| echo: false
+y = monthly_counts_vio["violent"].copy()
+y.index = pd.date_range("1990-01-01", periods=len(y), freq="MS")
+
+idx_dt = y.index  # DatetimeIndex (month start)
+
+# dummies
+X_df = pd.DataFrame(np.asarray(X)[:, :2], index=idx_dt, columns=["during", "post"])
+
+# unemployment (ensure numeric!)
+u = pd.Series(pd.to_numeric(unem_new["Value"], errors="coerce").to_numpy(),
+              index=idx_dt, name="unemploy_rate")
+
+# exog
+exog = pd.concat([X_df, u], axis=1)
+
+# align
+df0 = pd.concat([y.rename("y"), exog], axis=1).dropna()
+y_aligned_vio = df0["y"]
+X_aligned_vio = df0.drop(columns="y")
+```
+
+```{python property with exog}
+#| echo: false
+# y (violent)
+y_prop = monthly_counts_prop["property"].copy()
+y_prop.index = pd.date_range("1990-01-01", periods=len(y_prop), freq="MS")
+
+idx_dt = y_prop.index  # DatetimeIndex (month start)
+
+# dummies
+X_df = pd.DataFrame(np.asarray(X)[:, :2], index=idx_dt, columns=["during", "post"])
+
+# unemployment (ensure numeric!)
+u = pd.Series(pd.to_numeric(unem_new["Value"], errors="coerce").to_numpy(),
+              index=idx_dt, name="unemploy_rate")
+
+# exog
+exog = pd.concat([X_df, u], axis=1)
+
+# align
+df0 = pd.concat([y_prop.rename("y"), exog], axis=1).dropna()
+y_aligned_prop = df0["y"]
+X_aligned_prop = df0.drop(columns="y")
+```
+
+
+## Abstract {.unnumbered}
+
+This is the abstract. It should briefly describe the context of the report and highlight the findings of highest interest to the target readers (other students in the class, the GSI, and the instructor). 
+Usually, the abstract is 150-300 words.
+
+# Introduction
+
+Crime remains a major concern for citizens of Detroit. Many Detroit voters cite it as their primary concern in Mayoral elections and a quarter of the city’s general fund goes towards fighting crime (cite). This concern is not unwarranted, as Detroit has considerably higher rates of crime compared to many other U.S. cities with a 6,086.6 total crime rate per 100,000 in 2024, which is 187.2% greater than the national average  (cite). When ranked among the 30 largest U.S. cities, Detroit had the third highest total crime per 100,00 rate. 
+Detroit also faces economic disadvantages and is one of the poorest major cities in the United States. The median household income is well below the national average and a large proportion of residents live in poverty (cite). The connection between economic conditions and crime has been studied intensively, with poorer socioeconomic conditions frequently associated with increases in violent offenses and property crimes (cite). Unemployment is frequently used as an indicator of general economic conditions. However, the relationship between unemployment and crime remains unclear, with mixed findings across studies (cite).
+The Covid-19 pandemic has rekindled consideration of how crime is impacted by major social and economic disruptions. Specifically, many scholars and governments are continuing to work to fully understand the impact of the Covid-19 pandemic and lockdowns on crime. There were clear effects at the beginning of the pandemic, with overall crime reports falling in many major cities in the first quarter of 2020 (cite). However, further research is needed to explore how crime reports have changed after the pandemic, as it remains unclear whether crime reports returned to pre-pandemic levels following the end of lockdowns or whether new patterns have emerged.
+To understand how crime changes over time, and in particular identify the impact of the Covid-19 pandemic, it is essential to use time series methods. With this analysis, we aimed to answer three specific questions:
+Does Detroit crime exhibit cyclical behavior and a long term trend over time? How did crime patterns change during the COVID-19 pandemic, and were any lasting changes observed from the pre-pandemic to post-pandemic period? Do contemporaneous or past unemployment rates provide additional insight in crime patterns?
+
+# Data
+
+To source the data for our project, we first downloaded the U.S. Bureau of Labor Statistics’  Wayne County unemployment data from January 1990 to January 2026. This provides us with seasonally unadjusted monthly unemployment rates for Detroit, Dearborn, Livonia, Canton, Westland, Taylor, Grosse Pointes, and other smaller nearby cities of Wayne County.
+
+Afterwards, we examined the crime incidents occurring in Detroit. This data was obtained from the official website of the Federal Bureau of Investigation (FBI) through its Uniform Crime Reporting program. This publicized the standardized crime data from over 18,000 local, state, federal, and campus law enforcement agencies, providing detailed information regarding the nature and location of each offense. The FBI’s UCR allowed us to group crimes together by type, violent (homicide, rape, robbery, aggravated assault) and property (arson, burglary, larceny-theft, and motor vehicle theft). To compile our data, we downloaded both the property and violent crime reported by the Detroit Police Department from January 1990 to December 2025, included.
+
+It is also worthwhile to note that there was a federal shift in the reporting system from the Summary Reporting System (SRS) to the National Incident-Based Reporting System (NIBRS) on January 1st, 2021. The old SRS system simply provided monthly aggregates of crime grouped into 10 possible offenses, where the new NIBRS captures information for 52 possible offenses, demographic details, relationships between victims and offenders, and for multiple crimes to be filed in the same incident report. Most notably, the SRS employed a hierarchy rule, where incidents with multiple offenses only reported the most serious offense. The removal of this hierarchy rule during the implementation of the NIBRS resulted in minimal increases toward the rates of property crimes. Since our approach is taking a holistic approach to examining the relationship between the monthly-aggregate temporal dependencies of property and violent crime, we do not anticipate this shift in the reporting system to provide any inconsistencies in our evaluation.
+
+Because unemployment data can be difficult to localize precisely at the city level, Wayne County’s unemployment rate was selected as the most concentrated and appropriate proxy for Detroit’s unemployment conditions. Wayne County has an estimated population of 1,771,063, while Detroit’s with an estimated population of 645,705 accounts for nearly 36.5% of the county’s total population. Given that Detroit represents over one third of Wayne County’s population and serves as its largest urban and economic center, the county level unemployment rate provides a reasonable estimate of labor market trends affecting the city. This approach allows for a more accurate and reliable measure when city-specific unemployment data are unavailable. 
+
+After downloading our data, we verified the integrity of the time series. Notably, the FBI data for crime and unemployment are perfectly clean for Detroit. The unemployment data produced a singular NaN missing value for the month of October in 2025. There are several methods for dealing with missing data in time series \[1\], but the method we have chosen is to impute this value using linear interpolation. Linear interpolation estimates our missing observation by drawing a line between adjacent known values (September and November 2025 unemployment rates, in this case) and assigning an intermediate value accordingly. Since this is the only singular missing value, linear interpolation provides a reasonable approach to preserve the continuity of our series. We can examine how linear interpolation works using the formula \[2\]:
+
+$$
+y = y_0 + (x-x_0)\frac{(y_1-y_0)}{(x_1-x_0)}
+$$
+
+Where $(x_0,x_1)$ are the known timepoints, with $(y_0,y_1)$ as the known values, respectively. In simpler terms, we would simply average the years since they are adjacently spaced in time.
+
+After imputing our missing value \[3\], we examine our initial plot for our data. 
+
+Here we can observe a strong long-term downward trend in both property and violent crime rates in Detroit from the early 1990s through 2025. Property crime declines sharply from about 9000 to around 2300 in recent years, while violent crime decreases more gradually from approximately 2300 to 900. Property crime remains consistently higher than violent crime and exhibits greater volatility. Both property and violent crime appear to be non-stationary, as they both exhibit seasonal patterns and they are decreasing over time. Property crime declined more dramatically than violent crimes, possibly as a result of technological advancements or policing changes. Within this chart, we can notice a small irregular fluctuation within the property crime during 2020, likely due to the lockdown restrictions of the COVID-19 pandemic.
+
+Afterwards, we plotted unemployment rates for Wayne County during the same time period.
+
+From this plot, we can notice that the unemployment rate exhibits clear seasonal behavior over time, with major spikes due to harsh economic downturns. Unemployment rates were elevated during the early 1990s, declined through the early 2000s, and then promptly rose during the Great Recession around 2008-2010, reaching levels around 17%. After falling through the 2010s, unemployment dramatically spiked in 2020, reflecting the COVID-19 shock, before quickly declining again. Outside of these periods, unemployment generally fluctuates around 4-9%, displaying moderate short-term variation. Overall this time series suggests strong trends and seasonality, with temporary disruptions due to economic crises.
+
+Based on the noticeable disruptions for both the crime and unemployment during the COVID timeline, we included an indicator variable distinguishing the before, during, and after periods to account for this break. The pandemic provides a fundamental shift to economic and social conditions, particularly due to transitions to at-home work, lockdown restrictions, and temporary business closures. We believe that these changes fundamentally altered crime patterns and labor market trends, producing abrupt deviations from previous trends. Introducing a COVID indicator allows us to model it as an exogenous variable later in the analysis.
+
+After plotting the ACF and PACF for Violent Crime and Property Crime for pre and post-covid, we notice that the pattern for data significantly changes.
+
+
+
+# Methods
+
+Due to the seasonal nature of crime in Detroit in the initial data exploration, using the seasonal extension of ARMA (auto-regressive moving average) models, SARIMA was reasonable. Here, we consider SARIMA and SARIMAX. (Additional description here depending on time plot and ACF for why this is appropriate)
+
+**Model Consideration**
+
+_Part I_: SARIMA vs SARIMA
+
+The time series for crime in Detroit diverged during the Covid-19 pandemic. Thus, an appropriate model for this data would account for pre-Covid, post-Covid, and during Covid seasons. There are two approaches to consider this: (1) model SARIMAX with a dummy variable for these time periods, and (2) fit 3 separate SARIMA models for the three periods. Here, data is categorized as pre, during, post Covid with the following identifiers. Let $\mathcal{T}$ denote the time series data for crime.
+
+<!-- \begin{align*} -->
+<!--   D_{pre} &= I(t < 03-01-2020) \\ -->
+<!--   D_{during} &= I(03-01-2020 \leq t \leq 07-01-2022)\\ -->
+<!--   D_{post} &= I(t > 07-01-2022) -->
+<!-- \end{align*} -->
+
+The indicator variables for the SARIMAX model are
+\begin{align}
+  D_{\text{during},t} &= I(03/01/2020 \leq t \leq 07/01/2022), \\
+  D_{\text{post},t} &= I(t > 07/01/2022).
+\end{align}
+where "pre" is the reference category.
+
+The equation for SARIMAX with constant mean and the covid indicator variables:
+\begin{align}
+\phi(B)\Phi(B^{12})
+\Big(
+Y_t - \mu 
+- \beta_1 D_{\text{during},t}
+- \beta_2 D_{\text{post},t}
+\Big)
+=
+\theta(B)\Theta(B^{12})\varepsilon_t.
+\end{align}
+
+where $\mu$ is the mean of the equation for crime before covid ("pre"). While the mean can be different across the three time periods, this SARIMA model does not allow for different dynamics (ARMA, Seasonal ARMA) terms. 
+
+(2)
+
+In order to fit SARIMA on the three subsets of crime, 3 models are necessary for each time period. The following equations detail the form of the pre-covid, during-covid, and post-covid seasons:
+
+$$\phi_{\text{pre}}(B)\Phi_{\text{pre}}(B^{12})
+  \big(Y_t - \mu_{\text{pre}}\big)
+  =
+  \theta_{\text{pre}}(B)\Theta_{\text{pre}}(B^{12})\varepsilon_t,
+  \qquad t \in \mathcal{T}_{\text{pre}}$$
+
+
+$$\phi_{\text{dur}}(B)\Phi_{\text{dur}}(B^{12})
+  \big(Y_t - \mu_{\text{dur}}\big)
+  =
+  \theta_{\text{dur}}(B)\Theta_{\text{dur}}(B^{12})\varepsilon_t,
+  \qquad t \in \mathcal{T}_{\text{during}}$$
+
+
+$$\phi_{\text{post}}(B)\Phi_{\text{post}}(B^{12})
+  \big(Y_t - \mu_{\text{post}}\big)
+  =
+  \theta_{\text{post}}(B)\Theta_{\text{post}}(B^{12})\varepsilon_t,
+  \qquad t \in \mathcal{T}_{\text{post}}$$
+
+
+Because these models are fit separately, each model contains it's own intercept or drift term, ARMA parameters, and seasonal ARMA parameters, allowing more flexibility to account for the irregularities identified in the time plot of crime. 
+
+_Goal: This is looking at the payoff between degrees of freedom and model complexity (see if there's any literature for this)._
+
+_Part II_ SARIMAX with and without unemployment
+
+In order to identify associations between crime and unemployment before, during, and after covid, unemployment is added as an exogenous variable. Using the Likelihood Ratio Test, we assess whether the addition of unemployment explains more variation in crime than covid and the ARMA and seasonal ARMA terms alone. 
+
+Goal: Identify whether unemployment is associated with crime. 
+
+_Part III_ SARIMAX modeling unemployment with lag
+
+
+**Trend Considerations**
+
+The time plot in Figure 1 suggests that both a constant and linear trend are reasonable. The SARIMAX model with a drift would have the following equation
+
+\begin{align*}
+  \phi(B)\Phi(B^{12})
+  \left(
+  Y_t 
+  - \mu 
+  - \delta t
+  - \beta_1 D_{\text{during},t}
+  - \beta_2 D_{\text{post},t}
+  \right)
+  =
+  \theta(B)\Theta(B^{12})\varepsilon_t
+\end{align*}
+
+In order to account for the possibility of drift, both SARIMAX with constant and linear trends were fit. Accounting for drift avoids non-stationarity concerns and differencing, allowing for the proper specification of the mean function with respect to time (double check. trying to say varies with time)
+
+**Model Selection Criteria**
+
+In order to restrict model checking, the Akaike information criterion (AIC) was used as a means of comparison. Although AIC values provide guidance in comparing these models based on prediction, it should not be used as a statistical test (Lecture 5). Before considering the models further, the roots were checked for all models to ensure causality invertibility, and reducibility [Lecture 5]. Lastly, we required that the estimated coefficients of the non-seasonal and seasonal ARMA terms be non-zero to avoid unnecessary model complexity.  
+
+# Results
+
+**Model Fitting**
+Because the sample ACF and time series plots for both violent and property crime show clear seasonality and negative linear trends, the selection of SARIMA models was restricted to $(p, 0, q) \times (P, 0, Q)_{12}$ with linear trends and intercepts. Two exogenous variables were included: (1) an indicator of time relative to the Covid-19 pandemic ("pre" (reference category), "during", and "post") and (2) contemporary unemployment rates. To restrict model checking, AIC values were evaluated for models ranging from SARIMAX$(0, 0, 0) \times (0, 0, 0)_{12}$ to SARIMAX$(3, 0, 3) \times (3, 0, 3)_{12}$. Within the restricted low-complexity parameter space, the 50 models with the lowest AIC values all had orders satisfying $p, q, P, Q \leq 2$. These models and their AIC values are included in the Supplementary material (@tbl-aic-vio, @tbl-aic-prop). 
+
+_SARIMAX_$(1, 0, 1)\times(1, 0, 1)_{12}$ _for Violent Crime_
+
+Models were tested in order of decreasing AIC (and excluding models without seasonal terms). Any models with unit roots were excluded to ensure that causality and invertibility held. The model selected for the violent crime time series was SARIMAX$(1, 0, 1)\times(1, 0, 1)_{12}$ with an AIC of -57.120. Nested models such as SARIMAX$(1, 0, 0)\times(0, 0, 1)_{12}$ (AIC: -407.197) and SARIMAX$(1, 0, 1)\times(0, 0, 1)_{12}$ (AIC: -139.820) had non-unit roots, but further investigation of the residuals' sample ACF confirmed that these models did not appropriately capture seasonality. AIC comparisons and residual analysis between the three models are included in Supplementary material (@fig-compare-alts-vio). 
+
+
+```{python violent crime model}
+#| echo: false
+model_vio = SARIMAX(
+    np.log(y_aligned_vio),
+    exog=X_aligned_vio,
+    order=(1,0,1),
+    seasonal_order=(0,0,1,12),
+    trend="ct"
+).fit(disp=False)
+```
+
+The following shows the coefficients of the model and the test statistics and p-value associated with the two sided test:
+
+$$H_0: \beta = 0 \quad \quad H_a: \beta \neq 0$$
+
+
+| Parameter | Coefficient | Std. Error | $p$-value |
+|-----------|------------|------------|-----------|
+| $\beta_0$ | 0.2733 | 0.111 | 0.014 |
+| $\delta$ | -0.0003 | 0.000 | 0.033 |
+| $\beta_{\text{during}}$ | -0.4206 | 0.105 | 0.000 |
+| $\beta_{\text{post}}$ | 3.0096 | 0.192 | 0.000 |
+| $\beta_{\text{unemp}}$ | -0.0043 | 0.020 | 0.829 |
+| $\phi_1$ | 0.9082 | 0.027 | 0.000 |
+| $\theta_1$ | 0.1292 | 0.064 | 0.044 |
+| $\Phi_1$ | 0.6541 | 0.114 | 0.000 |
+| $\Theta_1$ | -0.3388 | 0.113 | 0.003 |
+| $\sigma^2$ | 0.0486 | 0.005 | 0.000 |
+: Summary Table of SARIMAX (1, 0, 1) x (1, 0, 1) 12 for Violent Crime {#tbl-coeffs-vio}
+
+- Mention the weird post result: this can be due to structural break from before COVID to after COVID. 
+- intercept: baseline log crime level when time unemployment = 0, not meaningful 
+- trend: -0.03% , crime declines by about 0.03% per month, holding everything else constant. crime decreases by 12* 0.03% = 0.36% a year. 
+- during: During COVID, crime was about 34% lower than pre-COVID, holding unemployment and time trend constant.change in percent is approx 100  times e^{cofficient} - 1.
+- post: 1924% increase from pre-COVID. would imply crime increased by nearly 20× relative to pre-COVID (unrealistic).
+- unemployment is not:  a 1-unit increase in unemployment rate is associated with about 0.4% decrease in crime. very small. 
+- AR term interpretation: Crime this month is heavily related to last month.
+- MA term interpretation: small effect Small shock smoothing
+- SAR term interpretation: relatively large. Crime 12 months ago strongly predicts current crime. Clear evidence of annual seasonality 
+- SMA term interpretation: Seasonal shock correction. Moderate effect size. 
+
+_Residual Analysis for the Violent Crime Model_
+
+To check the model fit, the residuals were plotted on a time plot and the sample ACF of the residuals revealed no clear patterns. The sample ACF (@fig-acf-model_vio) of residuals showed that 2 of 40 lags fall outside of the band that measures chance variation (Lecture 2, Ionides (2026)). Therefore, based on the data, there is insufficient evidence to suggest that the residuals of the model are not iid. From this analysis, the SARIMAX$(1, 0, 1)\times(1, 0, 1)_{12}$ model captured the trend in the data and the noise terms can be modeled as iid. The QQplot was used to test whether the residuals could be modeled as Gaussian. 
+
+```{python qqplot for residuals of violent crime}
+#|echo: false
+#|nlayout-ncol: 2
+#|label: fig-qqplot-vio
+#|fig-align: center
+resids = model_vio.resid
+
+fig, ax = plt.subplots(figsize=(5, 2))
+sm.qqplot(resids, line='s', ax=ax)
+plt.title("QQ Plot of SARIMAX(1, 0, 1) x (1, 0, 1) Residuals")
+plt.show()
+
+```
+The QQ plot suggests that the residuals can be modeled as approximately normally distributed, with deviations in the tails (@fig-qqplot-vio). In particular, there is one large negative residual corresponding to July 1, 2022, which coincides with the cutoff date for the COVID indicator variable. From this analysis, it is possible that the model does not capture the gradual shift in violent crime incidents between the COVID and post-COVID periods. 
+
+```{python}
+#| echo: false
+min_value = resids.min()
+min_index = resids.idxmin()
+
+#print("Most negative residual:", min_value)
+#print("Index of that residual:", min_index)
+
+max_value = resids.max()
+max_index = resids.idxmax()
+
+#print("Most positive residual:", max_value)
+#print("Index of that residual:", max_index)
+```
+
+
+_SARIMAX_$(1, 0, 1)\times(1, 0, 0)_{12}$ _for Property Crime_
+
+Similarly, SARIMAX_$(1, 0, 1)\times(1, 0, 0)_{12}$ was found to be an appropriate model for the property crime time series. 
+
+```{python property crime model}
+#| echo: false
+model_prop = SARIMAX(
+    np.log(y_aligned_prop),
+    exog=X_aligned_prop,
+    order=(1,0,0),
+    seasonal_order=(1,0,0,12),
+    trend="ct"
+).fit(disp=False)
+```
+
+| Parameter | Coefficient | Std. Error | $p$-value |
+|---------------|----------|---------|-------|
+| $\beta_0$     | 0.3462   | 0.109   | 0.002 |
+| $\delta$          | -0.0002  | 0.000   | 0.497 |
+| $\beta_{\text{during}}$         | -0.9669  | 0.081   | 0.000 |
+| $\beta_{\text{post}}$           | 3.2109   | 0.207   | 0.000 |
+| $\beta_{\text{unemp}}$  | 0.0104   | 0.008   | 0.169 |
+| $\phi_1$          | 0.9095   | 0.021   | 0.000 |
+| $\theta_1$          | 0.0814   | 0.076   | 0.286 |
+| $\Phi_1$       | 0.5702   | 0.016   | 0.000 |
+| $\sigma^2$          | 0.0511   | 0.006   | 0.000 |
+: Summary Table of SARIMAX (1, 0, 1) x (1, 0, 0) 12 for Property Crime {#tbl-coeffs-prop}
+
+- drift, unemploy, and ma.L1 are not significant
+- during: During the covid period, the series dropped by about 0.97 units, holding everything else constant.
+- post: same as above
+- AR coeff is high meaning shocks decay slowly. The series is highly autocorrelated.
+- seasonal AR: Clear yearly seasonality at lag 12.
+- MA term is insignificant
+- during and post are doing a lot of the explaining based on these coefficients
+- strangely, no drift. 
+- Unemployment rate does not significantly explain variation once AR structure is included.
+
+Mention removing MA term in supplementary and what happens to the sample ACF plot. Compare residual qq plots. 
+
+_Residual Analysis for the Property Crime Model_
+
+Same residuals as before! The minimum is explainable. find a way to explain what happened july 1 2023. 
+```{python qqplot for residuals of property crime}
+#| echo: false
+#| label: qqplot-resid-prop
+resids = model_prop.resid
+
+fig, ax = plt.subplots(figsize=(5, 2))
+sm.qqplot(resids, line='s', ax=ax)
+plt.title("QQ Plot of SARIMAX(1, 0, 1) x (1, 0, 1) Residuals")
+plt.show()
+
+min_value = resids.min()
+min_index = resids.idxmin()
+
+max_value = resids.max()
+max_index = resids.idxmax()
+
+
+```
+
+
+# Conclusions
+
+As well as discussing the main results, this section can include speculative interpretation. 
+References are welcome to connect your analysis to the broader literature.
+
+## Bibliographic references
+
+References are displayed using [BibTeX](http://www.bibtex.org/), e.g. `[@computo]` will be displayed as [@computo], where `computo` is the bibtex key for this specific entry.
+`@computo` gives an unparenthesized reference to @computo.
+The bibliographic information is automatically retrieved from the `.bib` file specified in the header of this document (here:`references.bib`).
+Some BibTeX entries relevant to STATS 531 are already in [`references.bib`](https://github.com/ionides/531w26/blob/main/template/references.bib), including @huang22, @notes531, @shumway17.
+
+## Other cross-references
+
+As already (partially) seen, Quarto includes a mechanism similar to the bibliographic references for sections, equations, theorems, figures, lists, etc.
+Have a look at [this page](https://quarto.org/docs/authoring/cross-references.html).
+For example, you may want to cross-reference to the supplementary material (@sec-supp).
+
+## Acknowledgments {.unnumbered}
+
+ This template builds on a template document by [Shao-Ting Chiu](https://github.com/stevengogogo/neurips-quarto-extension/).
+ AI was used for debugging via Google AI overview.
+Vscode with the Quarto extension was used for editing.
+
+## Bibliography {.unnumbered}
+
+::: {#refs}
+:::
+
+# Supplementary material {#sec-supp}
+
+**Supplementary Material for Violent Crime**
+
+```{python aic table for violent crime}
+#|echo: false
+#| label: tbl-aic-vio
+#| tbl-cap: "AIC for SARIMAX for Monthly Violent Crime"
+AIC_vio = [
+    {"AR(p)": 1, "MA(q)": 0, "SAR(P)": 2, "SMA(Q)": 2, "AIC": -426.423365},
+    {"AR(p)": 1, "MA(q)": 0, "SAR(P)": 0, "SMA(Q)": 1, "AIC": -407.196520},
+    {"AR(p)": 0, "MA(q)": 1, "SAR(P)": 0, "SMA(Q)": 0, "AIC": -404.888847},
+    {"AR(p)": 2, "MA(q)": 1, "SAR(P)": 2, "SMA(Q)": 0, "AIC": -402.817728},
+    {"AR(p)": 1, "MA(q)": 2, "SAR(P)": 0, "SMA(Q)": 2, "AIC": -383.434984},
+    {"AR(p)": 1, "MA(q)": 2, "SAR(P)": 0, "SMA(Q)": 1, "AIC": -381.828292},
+    {"AR(p)": 2, "MA(q)": 0, "SAR(P)": 0, "SMA(Q)": 0, "AIC": -371.138027},
+    {"AR(p)": 0, "MA(q)": 1, "SAR(P)": 1, "SMA(Q)": 1, "AIC": -346.937849},
+    {"AR(p)": 0, "MA(q)": 2, "SAR(P)": 2, "SMA(Q)": 1, "AIC": -317.989259},
+    {"AR(p)": 0, "MA(q)": 0, "SAR(P)": 1, "SMA(Q)": 2, "AIC": -310.594128},
+    {"AR(p)": 1, "MA(q)": 1, "SAR(P)": 2, "SMA(Q)": 0, "AIC": -301.501886},
+    {"AR(p)": 0, "MA(q)": 0, "SAR(P)": 0, "SMA(Q)": 0, "AIC": -293.715478},
+    {"AR(p)": 0, "MA(q)": 2, "SAR(P)": 1, "SMA(Q)": 1, "AIC": -254.752692},
+    {"AR(p)": 0, "MA(q)": 2, "SAR(P)": 2, "SMA(Q)": 2, "AIC": -237.529791},
+    {"AR(p)": 0, "MA(q)": 0, "SAR(P)": 0, "SMA(Q)": 2, "AIC": -228.992487},
+    {"AR(p)": 2, "MA(q)": 0, "SAR(P)": 2, "SMA(Q)": 1, "AIC": -219.110797},
+    {"AR(p)": 2, "MA(q)": 0, "SAR(P)": 1, "SMA(Q)": 2, "AIC": -218.934810},
+    {"AR(p)": 0, "MA(q)": 2, "SAR(P)": 1, "SMA(Q)": 0, "AIC": -209.068433},
+    {"AR(p)": 1, "MA(q)": 1, "SAR(P)": 2, "SMA(Q)": 2, "AIC": -190.267641},
+    {"AR(p)": 2, "MA(q)": 0, "SAR(P)": 2, "SMA(Q)": 2, "AIC": -189.042047},
+    {"AR(p)": 0, "MA(q)": 0, "SAR(P)": 2, "SMA(Q)": 2, "AIC": -185.894552},
+    {"AR(p)": 1, "MA(q)": 0, "SAR(P)": 1, "SMA(Q)": 0, "AIC": -181.537711},
+    {"AR(p)": 0, "MA(q)": 0, "SAR(P)": 1, "SMA(Q)": 1, "AIC": -172.695665},
+    {"AR(p)": 1, "MA(q)": 2, "SAR(P)": 1, "SMA(Q)": 0, "AIC": -171.827063},
+    {"AR(p)": 2, "MA(q)": 1, "SAR(P)": 0, "SMA(Q)": 2, "AIC": -165.876735}
+]
+
+AIC_vio_df = pd.DataFrame(AIC_vio)
+AIC_vio_df
+```
+
+```{python acf-model-vio}
+#| echo: false
+#| label: fig-acf-model_vio
+  
+resids = model_vio.resid
+
+fig, ax = plt.subplots(figsize=(5, 2))
+plot_acf(resids, ax=ax, lags=40)
+plt.tight_layout()
+plt.title("Sample Autocorrelation Function of SARIMAX(1, 0, 1) x (1, 0, 1)")
+plt.show()
+```
+
+
+_**Comparison of SARIMAX Models for Violent Crime**_
+
+SARIMAX$(1, 0, 0)\times(0, 0, 1)_{12}$ and SARIMAX$(1, 0, 1)\times(0, 0, 1)_{12}$ were two reasonable models for the time series of violent crime. However, they presented challenges absent from the final model choice SARIMAX$(1, 0, 1) \times (1, 0, 1)$.
+
+```{python roots of of model_vio_alt_1}
+#| echo: false
+model_vio_alt_1 = SARIMAX(
+    np.log(y_aligned_vio),
+    exog=X_aligned_vio,
+    order=(1,0,0),
+    seasonal_order=(0,0,1,12),
+    trend="ct"
+).fit(disp=False)
+
+#print(model_vio_alt_1.summary().tables[1])
+
+ar_roots = model_vio_alt_1.arroots
+#print("Magnitude of AR roots:", np.abs(ar_roots)) 
+ma_roots = model_vio_alt_1.maroots
+#print("Magnitude of MA roots:", np.abs(ma_roots)) 
+```
+
+```{python roots of model_vio_alt_2}
+#| echo: false
+model_vio_alt_2 = SARIMAX(
+    np.log(y_aligned_vio),
+    exog=X_aligned_vio,
+    order=(1,0,1),
+    seasonal_order=(0,0,1,12),
+    trend="ct"
+).fit(disp=False)
+
+#print(model_vio_alt_2.summary().tables[1])
+
+ar_roots = model_vio_alt_2.arroots
+#print("Magnitude of AR roots:", np.abs(ar_roots)) 
+
+ma_roots = model_vio_alt_2.maroots
+#print("Magnitude of MA roots:", np.abs(ma_roots)) 
+```
+
+In terms of numerical instability, the models were similar with roots close to 1.1 with the exception of the non-seasonal MA terms for the SARIMAX$(1, 0, 1) \times (1, 0, 1)$ and SARIMAX$(1, 0, 1) \times (0, 0, 1)$ models (@tbl-roots-vio). 
+
+| Model (p,q,P,Q) | AR (non-seasonal) | MA (non-seasonal) | Seasonal AR | Seasonal MA |
+|-----------------|-------------------|-------------------|-------------|-------------|
+| (1,1,1,1)       | 1.10111893        | 7.73816896        | 1.03600467  | 1.09439959  |
+| (1,1,0,1)       | 1.08504322        | 13.72208234       | $-$           | 1.20004983  |
+| (1,0,0,1)    | 1.06870966        | $-$                 | $-$           | 1.11992932  |
+: Check for Unit Roots {#tbl-roots-vio}
+
+However, the residual analysis indicated that the nested models did not fully account for the seasonality present in violent crime data whereas residuals of the SARIMAX $(1, 0, 1) \times (1, 0, 1)$ model could reasonably be modeled as iid (@fig-compare-alts-vio). In other words, the residuals could be described as uncorrelated. 
+
+```{python comparison of model residuals for violence}
+#| echo: false
+#| cap: "Comparison of sample ACF and QQplots for residuals of SARIMAX(1, 0, 1) x (1, 0, 1)_12 and alternative models"
+#| label: fig-compare-alts-vio
+#| layout-ncol: 2
+#| layout-nrow: 3
+
+resids = model_vio.resid
+
+fig, ax = plt.subplots(figsize=(5, 2))
+plot_acf(resids, ax=ax, lags=40)
+plt.tight_layout()
+plt.title("Sample Autocorrelation Function of SARIMAX(1, 0, 1) x (1, 0, 1)")
+plt.show()
+
+fig, ax = plt.subplots(figsize=(5, 2))
+sm.qqplot(resids, line='s', ax=ax)
+plt.title("QQPlot of SARIMAX(1, 0, 1) x (1, 0, 1) Residuals")
+plt.show()
+
+resids_alt_2 = model_vio_alt_2.resid
+
+fig, ax = plt.subplots(figsize=(5, 2))
+plot_acf(resids_alt_2, ax=ax, lags=40)
+plt.title("Sample Autocorrelation Function of SARIMAX(1, 0, 1) x (0, 0, 1) Residuals")
+plt.tight_layout()
+plt.show()
+
+fig, ax = plt.subplots(figsize=(5, 2))
+sm.qqplot(resids_alt_2, line='s', ax=ax)
+plt.title("QQPlot of SARIMAX(1, 0, 1) x (0, 0, 1) Residuals")
+plt.show()
+
+resids_alt_1 = model_vio_alt_1.resid
+
+fig, ax = plt.subplots(figsize=(5, 2))
+plot_acf(resids_alt_1, ax=ax, lags=40)
+plt.title("Sample Autocorrelation Function of SARIMAX(1, 0, 0) x (0, 0, 1) Residuals")
+plt.tight_layout()
+plt.show()
+
+fig, ax = plt.subplots(figsize=(5, 2))
+sm.qqplot(resids_alt_1, line='s', ax=ax)
+plt.title("QQplot of SARIMAX(1, 0, 0) x (0, 0, 1) Residuals")
+plt.show()
+```
+_**Removing the AR term with a near unit root**_
+
+Although the non-seasonal AR term has a near unit root, removing this term does not provide a model that sufficiently explains the underlying data.
+
+```{python removed AR for violent crime}
+#| echo: false
+model_vio_no_AR = SARIMAX(
+    np.log(y_aligned_vio),
+    exog=X_aligned_vio,
+    order=(0,0,1),
+    seasonal_order=(1,0,1,12),
+    trend="ct"
+).fit(disp=False)
+
+#print(model_vio_no_AR.summary().tables[1])
+
+ar_roots = model_vio_no_AR.arroots
+#print("Magnitude of AR roots:", np.abs(ar_roots)) 
+
+ma_roots = model_vio_no_AR.maroots
+#print("Magnitude of MA roots:", np.abs(ma_roots)) 
+
+```
+
+In particular, the sample ACF suggests that the residuals should not be modeled as uncorrelated or iid (@fig-no-ar). The QQplot also shows severe deviations from normality at the extremes. Thus, SARIMAX$(1, 0, 1) \times (1, 0, 1)$ still proved to be a more reasonable model for the violent crime time series.
+
+```{python removed AR plots}
+#| echo: false
+#| layout-ncol: 2
+#| label: fig-no-ar
+resids = model_vio_no_AR.resid
+
+fig, ax = plt.subplots(figsize=(5, 2))
+plot_acf(resids, ax=ax, lags=40)
+plt.title("Sample Autocorrelation Function of SARIMAX(0, 0, 1) x (1, 0, 1) Residuals")
+plt.tight_layout()
+plt.show()
+
+fig, ax = plt.subplots(figsize=(5, 2))
+sm.qqplot(resids, line='s', ax=ax)
+plt.title("QQplot of SARIMAX(0, 0, 1) x (1, 0, 1) Residuals")
+plt.show()
+```
+
+------------
+**Supplementary Material for Property Crime**
+
+```{python}
+#|echo: false
+#| label: tbl-aic-prop
+#| tbl-cap: "AIC for SARIMAX for Monthly Property Crime"
+
+AIC_prop = [
+    [0, 2, 0, 0, -620.069393],
+    [0, 1, 0, 0, -585.993320],
+    [1, 0, 2, 0, -514.872524],
+    [1, 0, 0, 0, -512.089723],
+    [2, 0, 0, 1, -478.365250],
+    [0, 0, 0, 0, -475.596104],
+    [0, 2, 2, 0, -430.619417],
+    [0, 2, 1, 1, -423.472542],
+    [0, 2, 1, 0, -410.988575],
+    [0, 0, 0, 1, -368.070251],
+    [0, 2, 2, 1, -364.626457],
+    [0, 0, 1, 0, -363.500137],
+    [1, 0, 1, 0, -323.329053],
+    [0, 0, 0, 2, -233.581142],
+    [1, 2, 2, 0, -219.324080],
+    [ 0, 0, 2, 0, -208.162637],
+    [ 1, 2, 1, 0, -205.178895],
+    [ 1, 0, 2, 2, -202.696587],
+    [ 1, 0, 1, 1, -167.161953],
+    [ 2, 2, 0, 0, -164.792371],
+    [ 2, 0, 1, 2, -160.663216],
+    [ 1, 2, 0, 0, -160.212842],
+    [ 0, 0, 1, 2, -125.840172],
+    [ 2, 0, 1, 1, -116.519278],
+    [ 2, 2, 2, 1, -110.586662]
+]
+
+
+AIC_prop_df = pd.DataFrame(AIC_prop, columns=['AR(p)', 'MA(q)', 'SAR(P)', 'SMA(Q)', 'AIC'])
+
+AIC_prop_df
+```
+
+_**Removing the seasonal MA terms**__
+```{python}
+#| echo: false
+ar_roots = model_prop.arroots
+ma_roots = model_prop.maroots
+```
+
+```{python}
+#| echo: false
+#| label: acf-resid-prop
+resids = model_prop.resid
+
+fig, ax = plt.subplots(figsize=(5, 2))
+plot_acf(resids, ax=ax, lags=40)
+plt.title("Sample Autocorrelation Function of SARIMAX(1, 0, 1) x (1, 0, 1) Residuals")
+plt.tight_layout()
+plt.show()
+```
+
